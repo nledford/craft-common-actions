@@ -55,7 +55,14 @@ runs:
         # that touches a manifest with nothing to restore, so the fallback
         # prefix below deliberately omits it and lets Cargo invalidate the
         # stale parts. See issues #33 and #39.
-        compatible=$(printf '%s\n' "$guest" "$CACHE_CONFIGURATION" "$CACHE_PROFILE" | sha256sum | cut -d ' ' -f 1)
+        # A cross build's target triple keeps its cache apart from a native one even
+        # if the two guests happen to match. Native keys do not change.
+        triple=$(ssh freebsd 'sh -eu' <<'GUEST'
+        [ ! -f /var/tmp/craft-cross/env ] || { . /var/tmp/craft-cross/env; printf '%s\n' "${CARGO_BUILD_TARGET-}"; }
+        GUEST
+        )
+        case "$triple" in *[!A-Za-z0-9_.-]*) echo 'invalid cross target' >&2; exit 1 ;; esac
+        compatible=$(printf '%s\n' "$guest" "$CACHE_CONFIGURATION" "$CACHE_PROFILE" ${triple:+"$triple"} | sha256sum | cut -d ' ' -f 1)
         fingerprint=$(printf '%s\n' "$compatible" "$CACHE_SOURCE_HASH" | sha256sum | cut -d ' ' -f 1)
         fallback_prefix="freebsd-cargo-v3-$compatible-"
         prefix="$fallback_prefix$fingerprint-"
@@ -115,6 +122,14 @@ runs:
             return "$status"
           fi
         }
+        # A cross build ("Set up the aarch64 cross toolchain") writes its binaries and
+        # dependencies under target/<triple>/<profile>, and only its build scripts
+        # and proc macros under target/<profile>: both are needed for a warm build.
+        triple=$(ssh freebsd 'sh -eu' <<'GUEST'
+        [ ! -f /var/tmp/craft-cross/env ] || { . /var/tmp/craft-cross/env; printf '%s\n' "${CARGO_BUILD_TARGET-}"; }
+        GUEST
+        )
+        case "$triple" in *[!A-Za-z0-9_.-]*) echo 'invalid cross target' >&2; exit 1 ;; esac
         mkdir -p "$cache"
         case "$CACHE_PHASE" in
           restore)
@@ -123,8 +138,14 @@ runs:
             push git /var/tmp/craft-cargo/git
             # Do not load both profiles into the space-constrained VM at once.
             push "target/$CACHE_PROFILE" "/var/tmp/craft-target/$CACHE_PROFILE"
+            if [ -n "$triple" ]; then
+              # shellcheck disable=SC2029
+              ssh freebsd "mkdir -p /var/tmp/craft-target/$triple/$CACHE_PROFILE"
+              push "target/$triple/$CACHE_PROFILE" "/var/tmp/craft-target/$triple/$CACHE_PROFILE"
+            fi
             ;;
           package)
+            # Only the native leg packages; a cross build never reaches this phase.
             if [ "$CACHE_CAN_SAVE" = true ]; then
               pull target/debug /var/tmp/craft-target/debug
             fi
@@ -138,11 +159,13 @@ runs:
             pull registry /var/tmp/craft-cargo/registry
             pull git /var/tmp/craft-cargo/git
             for profile in debug release; do
-              # profile is one of the two literal directory names above.
-              # shellcheck disable=SC2029
-              if ssh freebsd "test -d /var/tmp/craft-target/$profile"; then
-                pull "target/$profile" "/var/tmp/craft-target/$profile"
-              fi
+              for dir in "$profile" ${triple:+"$triple/$profile"}; do
+                # dir is a literal profile name, or <validated triple>/<profile>.
+                # shellcheck disable=SC2029
+                if ssh freebsd "test -d /var/tmp/craft-target/$dir"; then
+                  pull "target/$dir" "/var/tmp/craft-target/$dir"
+                fi
+              done
             done
             ;;
           *) echo 'invalid cache phase' >&2; exit 1 ;;

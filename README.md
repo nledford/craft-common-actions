@@ -223,9 +223,11 @@ action's version prefix.
 
 Cache data is restored on the host and explicitly transferred to the guest's
 `/var/tmp/craft-cargo` and `/var/tmp/craft-target`. Only registry/git data and
-`debug`/`release` artifacts are saved, excluding incremental state, Cargo
-credentials/config and Rust toolchains. Successful non-PR runs save caches on a best-effort basis; PRs
-only restore. Restore, checkpoint and save failures are non-blocking; each phase has a 10-minute
+`debug`/`release` artifacts are saved (for a cross build, also its `<triple>/debug` and
+`<triple>/release`), excluding incremental state, Cargo credentials/config and Rust
+toolchains. Non-PR runs save caches on a best-effort basis; PRs only restore. The FreeBSD test
+workflow saves once its build has succeeded, even if a test or the package check then failed, so a
+flaky test does not keep every run cold; `release.yml` saves only after a successful run. Restore, checkpoint and save failures are non-blocking; each phase has a 10-minute
 time budget. A failed
 restore discards partial guest data before building; a failed checkpoint discards
 the partial release profile before packaging. Required build/package steps reclaim

@@ -185,7 +185,8 @@ jobs:
         with:
           configuration: ${{ toJSON(inputs) }}
           source-hash: ${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/build.rs', '.cargo/**', 'rust-toolchain*', 'packaging/**', '.github/workflows/freebsd.yml') }}
-      - name: Build and test
+      - name: Build
+        id: build
         shell: freebsd {0}
         run: |
           set -eu
@@ -210,6 +211,31 @@ jobs:
           if [ -f craft-i18n.rev ]; then export CRAFT_I18N_DIR="$PWD/craft-i18n" CRAFT_I18N_REQUIRED=1; fi
           # Written by "Set up the aarch64 cross toolchain": cargo then builds for aarch64.
           [ ! -f /var/tmp/craft-cross/env ] || . /var/tmp/craft-cross/env
+          # Keep argument data out of shell source.
+          CARGO_PROFILE_DEV_DEBUG=0 python3 - <<'PY'
+          import os
+          import shlex
+
+          os.execvp("cargo", ["cargo", "build", "--workspace", "--all-targets", "--locked",
+                              *shlex.split(os.environ["CARGO_BUILD_EXTRA_ARGS"])])
+          PY
+      # A separate step, so that the cache save below can tell a failed build (nothing worth
+      # keeping) from a failed test (the compiled dependencies are still good).
+      - name: Test
+        if: ${{ !inputs.skip-tests }}
+        shell: freebsd {0}
+        run: |
+          set -eu
+          [ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
+          # The environment of "Build": steps share the guest's files, not its shell variables.
+          if [ -d craft-fonts ]; then
+            export CRAFT_FONTS_DIR="$PWD/craft-fonts"
+          fi
+          if [ "${{ inputs.require-craft-fonts }}" = "true" ]; then
+            export CRAFT_FONTS_REQUIRED=1
+          fi
+          if [ -f craft-i18n.rev ]; then export CRAFT_I18N_DIR="$PWD/craft-i18n" CRAFT_I18N_REQUIRED=1; fi
+          [ ! -f /var/tmp/craft-cross/env ] || . /var/tmp/craft-cross/env
           # Tests run as an ordinary user: root is never refused a file, so a test that expects
           # "permission denied" fails as root, and a permission bug root would hide goes unseen.
           as_tester() {
@@ -221,25 +247,17 @@ jobs:
             chown -R craft-test "$CARGO_TARGET_DIR" "$CARGO_HOME" "$PWD"
             HOME=/home/craft-test RUSTUP_HOME=$rustup_home su -m craft-test -c 'sh -eu'
           }
-          # Keep argument data out of shell source, including the tester's shell below.
-          CARGO_PROFILE_DEV_DEBUG=0 python3 - <<'PY'
-          import os
-          import shlex
-
-          os.execvp("cargo", ["cargo", "build", "--workspace", "--all-targets", "--locked",
-                              *shlex.split(os.environ["CARGO_BUILD_EXTRA_ARGS"])])
-          PY
-          if [ "${{ inputs.skip-tests }}" != "true" ]; then
-            if [ "${{ matrix.arch }}" = aarch64 ]; then
-              # The build above compiled every test target; an x86_64 guest cannot run them.
-              echo "::notice title=FreeBSD aarch64::cross-compiled on x86_64: tests built, not run"
-            elif [ "${{ inputs.custom-test-command != '' }}" = "true" ]; then
-              # Isolate the command list: an early failure in an && chain must not
-              # be hidden by a later successful packaging command in this script.
-              # The command text travels as data in the environment, never in this script's source.
-              printf '%s\n' "$CUSTOM_TEST_COMMAND" | as_tester || exit "$?"
-            else
-              as_tester <<'CRAFT_TESTS'
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            # The build compiled every test target; an x86_64 guest cannot run them.
+            echo "::notice title=FreeBSD aarch64::cross-compiled on x86_64: tests built, not run"
+          elif [ "${{ inputs.custom-test-command != '' }}" = "true" ]; then
+            # Isolate the command list: an early failure in an && chain must not
+            # be hidden by a later successful packaging command in this script.
+            # The command text travels as data in the environment, never in this script's source.
+            printf '%s\n' "$CUSTOM_TEST_COMMAND" | as_tester || exit "$?"
+          else
+            # Keep argument data out of shell source, including the tester's shell below.
+            as_tester <<'CRAFT_TESTS'
           CARGO_PROFILE_DEV_DEBUG=0 python3 - <<'PY'
           import os
           import shlex
@@ -248,7 +266,6 @@ jobs:
                               *shlex.split(os.environ["CARGO_TEST_EXTRA_ARGS"])])
           PY
           CRAFT_TESTS
-            fi
           fi
       # package.sh builds for the guest's own architecture, so the cross-compiled aarch64
       # leg stops after the build.
@@ -290,8 +307,10 @@ jobs:
             fi
             tar -tzf "$archive"
           done
+      # Saved once the build has succeeded, even if a test or the package check failed: the
+      # compiled dependencies are good either way, and a flaky test must not keep every run cold.
       - name: Save FreeBSD Cargo cache
-        if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && steps.cargo-cache.outputs.key != '' && steps.cargo-cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && steps.cargo-cache.outputs.key != '' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         timeout-minutes: 10
         uses: storytold/craft-common-actions/actions/freebsd-cargo-cache@main

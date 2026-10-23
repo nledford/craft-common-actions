@@ -234,6 +234,49 @@ sys.exit(subprocess.run([os.environ['REAL_RSYNC'], *args]).returncode)
         self.transfer("save")
         self.assertEqual((self.cache / "target/release/app").read_text(), "cached-release")
 
+    def cross(self, triple="aarch64-unknown-freebsd"):
+        self.write(self.guest, "var/tmp/craft-cross/env", f"export CARGO_BUILD_TARGET={triple}\nexport PKG_CONFIG_ALLOW_CROSS=1\n")
+
+    def test_a_cross_build_has_its_own_cache_and_a_native_one_keeps_its_key(self):
+        native = self.identity()
+        self.cross()
+        cross = self.identity()
+        self.assertNotEqual(native["fallback-prefix"], cross["fallback-prefix"])
+        self.assertEqual(cross, self.identity())
+        # An empty env file (no target) leaves the native key as it was.
+        self.write(self.guest, "var/tmp/craft-cross/env", "export PKG_CONFIG_ALLOW_CROSS=1\n")
+        self.assertEqual(native, self.identity())
+
+    def test_an_unsafe_cross_target_is_refused(self):
+        self.cross("../escape")
+        result = self.run_script(IDENTITY)
+        self.assertNotEqual(result.returncode, 0, result)
+        result = self.run_script(TRANSFER, CACHE_PHASE="restore")
+        self.assertNotEqual(result.returncode, 0, result)
+
+    def test_a_cross_build_restores_and_saves_the_target_triple_profile_too(self):
+        self.cross()
+        triple = "aarch64-unknown-freebsd"
+        self.write(self.cache, "target/debug/build/host-script", "host")
+        self.write(self.cache, f"target/{triple}/debug/deps/libdependency.rlib", "cross-debug")
+        self.write(self.cache, f"target/{triple}/release/deps/libdependency.rlib", "cross-release")
+        self.transfer("restore")
+        self.assertEqual((self.guest / "var/tmp/craft-target/debug/build/host-script").read_text(), "host")
+        self.assertEqual((self.guest / f"var/tmp/craft-target/{triple}/debug/deps/libdependency.rlib").read_text(), "cross-debug")
+        # One profile at a time, for the cross directory as for the native one.
+        self.assertFalse((self.guest / f"var/tmp/craft-target/{triple}/release/deps/libdependency.rlib").exists())
+        self.write(self.guest, f"var/tmp/craft-target/{triple}/debug/app", "cross-built")
+        self.write(self.guest, f"var/tmp/craft-target/{triple}/debug/incremental/state", "discard")
+        self.transfer("save")
+        self.assertEqual((self.cache / f"target/{triple}/debug/app").read_text(), "cross-built")
+        self.assertFalse((self.cache / f"target/{triple}/debug/incremental").exists())
+        self.assertEqual((self.cache / "target/debug/build/host-script").read_text(), "host")
+
+    def test_a_native_build_ignores_any_target_triple_directory(self):
+        self.write(self.cache, "target/aarch64-unknown-freebsd/debug/app", "cross")
+        self.transfer("restore")
+        self.assertFalse((self.guest / "var/tmp/craft-target/aarch64-unknown-freebsd").exists())
+
     def test_transport_failure_is_visible(self):
         self.tool("rsync", "import sys\nsys.exit(23)\n")
         result = self.run_script(TRANSFER)
@@ -295,6 +338,11 @@ class WorkflowCacheIntegrationTests(unittest.TestCase):
                     self.assertEqual(cache_step.get("timeout-minutes"), "10")
                 self.assertIn("steps.cargo-cache.outputs.key != ''", save["if"])
                 self.assertIn("steps.cargo-cache.outcome", build["run"])
+                if filename == "freebsd.yml":
+                    # A failed test or package check must not keep the compiled dependencies from the cache.
+                    self.assertIn("!cancelled()", save["if"])
+                    self.assertIn("steps.build.outcome == 'success'", save["if"])
+                    self.assertEqual(build["id"], "build")
                 self.assertIn("pull_request", save["if"])
                 self.assertIn("toJSON(inputs)", restore["with"]["configuration"])
                 if filename == "release.yml":

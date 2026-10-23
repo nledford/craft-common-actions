@@ -21,8 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = Path(os.environ.get("FREEBSD_WORKFLOW", ROOT / ".github/workflows/freebsd.yml"))
 DATA = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
 STEPS = DATA["jobs"]["freebsd"]["steps"]
-BUILD_STEP = next(step for step in STEPS if step.get("name") == "Build and test")
+BUILD_STEP = next(step for step in STEPS if step.get("name") == "Build")
 BUILD_TEMPLATE = BUILD_STEP["run"]
+TEST_STEP = next(step for step in STEPS if step.get("name") == "Test")
+TEST_TEMPLATE = TEST_STEP["run"]
 CROSS_STEP = next(step for step in STEPS if step.get("name") == "Set up the aarch64 cross toolchain")
 PACKAGE_TEMPLATE = next(step["run"] for step in STEPS if step.get("name") == "Build and validate the FreeBSD package")
 
@@ -137,6 +139,10 @@ fi
                 (path / "partial").write_text("incomplete cache transfer")
             result = subprocess.run(["/bin/sh", "-c", render(BUILD_TEMPLATE)], cwd=work, env=env,
                                     text=True, capture_output=True, timeout=15)
+            if result.returncode == 0 and not skip_tests:
+                # The step's own `if: !inputs.skip-tests`; separate processes share files, never shell exports.
+                result = subprocess.run(["/bin/sh", "-c", render(TEST_TEMPLATE)], cwd=work, env=env.copy(),
+                                        text=True, capture_output=True, timeout=15)
             if result.returncode == 0 and package_check:
                 # Separate processes share files, never shell exports.
                 result = subprocess.run(["/bin/sh", "-c", render(PACKAGE_TEMPLATE)], cwd=work, env=env.copy(),
@@ -220,6 +226,17 @@ fi
                 self.assertEqual(result["code"], 42, result)
                 self.assertFalse(result["packaged"], result)
                 self.assertEqual(len(result["log"]), 1 + group, result)
+
+    def test_tests_are_their_own_step_so_the_cache_save_can_follow_the_build(self):
+        names = [step.get("name") for step in STEPS]
+        self.assertLess(names.index("Build"), names.index("Test"))
+        self.assertEqual(BUILD_STEP["id"], "build")
+        self.assertEqual(TEST_STEP["if"], "${{ !inputs.skip-tests }}")
+        save = next(step for step in STEPS if step.get("name") == "Save FreeBSD Cargo cache")
+        for term in ("!cancelled()", "steps.build.outcome == 'success'", "pull_request", "pull_request_target",
+                     "steps.cargo-cache.outputs.key != ''", "steps.cargo-cache.outputs.cache-hit != 'true'"):
+            self.assertIn(term, save["if"])
+        self.assertLess(names.index("Test"), names.index("Save FreeBSD Cargo cache"))
 
     def test_default_tests_must_pass_before_packaging(self):
         result = self.run_vm(fail_test=1)
